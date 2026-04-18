@@ -1,4 +1,4 @@
-import os, json, time, asyncio, logging
+import os, json, asyncio, logging, httpx
 import tweepy
 import anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,7 +15,7 @@ TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = int(os.environ['TELEGRAM_CHAT_ID'])
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 
-ACCOUNTS = ['OfficialJoelF', 'tradedmiami']
+ACCOUNTS = ['OfficialJoelF', 'growingmiami']
 SEEN_FILE = 'seen_tweets.json'
 PENDING_FILE = 'pending_tweets.json'
 EDIT_FILE = 'edit_state.json'
@@ -40,6 +40,13 @@ def get_x_client():
         access_token_secret=X_ACCESS_TOKEN_SECRET
     )
 
+def get_x_api_v1():
+    auth = tweepy.OAuth1UserHandler(
+        X_CONSUMER_KEY, X_CONSUMER_SECRET,
+        X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET
+    )
+    return tweepy.API(auth)
+
 def reword_tweet(text):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
@@ -52,9 +59,29 @@ def reword_tweet(text):
     )
     return message.content[0].text
 
-async def send_for_approval(app, tweet_id, original, reworded, account):
+async def download_media(urls):
+    files = []
+    async with httpx.AsyncClient() as client:
+        for i, url in enumerate(urls):
+            try:
+                r = await client.get(url, follow_redirects=True)
+                ext = 'mp4' if 'video' in r.headers.get('content-type', '') else 'jpg'
+                path = f'/tmp/media_{i}.{ext}'
+                with open(path, 'wb') as f:
+                    f.write(r.content)
+                files.append(path)
+            except Exception as e:
+                logging.error(f"Error downloading media: {e}")
+    return files
+
+async def send_for_approval(app, tweet_id, original, reworded, account, media_urls=[]):
     pending = load_json(PENDING_FILE, {})
-    pending[tweet_id] = {'original': original, 'reworded': reworded, 'account': account}
+    pending[tweet_id] = {
+        'original': original,
+        'reworded': reworded,
+        'account': account,
+        'media_urls': media_urls
+    }
     save_json(PENDING_FILE, pending)
 
     keyboard = [[
@@ -64,6 +91,19 @@ async def send_for_approval(app, tweet_id, original, reworded, account):
     ]]
 
     text = f"📢 New post from @{account}\n\n*Original:*\n{original}\n\n*Reworded:*\n{reworded}"
+
+    if media_urls:
+        media_files = await download_media(media_urls)
+        if media_files:
+            from telegram import InputMediaPhoto, InputMediaVideo
+            media_group = []
+            for path in media_files:
+                if path.endswith('.mp4'):
+                    media_group.append(InputMediaVideo(open(path, 'rb')))
+                else:
+                    media_group.append(InputMediaPhoto(open(path, 'rb')))
+            if media_group:
+                await app.bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=media_group)
 
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
@@ -85,13 +125,24 @@ async def handle_button(update, context):
 
     if action == 'approve':
         reworded = pending[tweet_id]['reworded']
-        get_x_client().create_tweet(text=reworded)
+        media_urls = pending[tweet_id].get('media_urls', [])
+
+        if media_urls:
+            api_v1 = get_x_api_v1()
+            media_files = await download_media(media_urls)
+            media_ids = []
+            for path in media_files:
+                res = api_v1.media_upload(path)
+                media_ids.append(res.media_id)
+            get_x_client().create_tweet(text=reworded, media_ids=media_ids)
+        else:
+            get_x_client().create_tweet(text=reworded)
+
         await query.edit_message_text(f"✅ Posted!\n\n{reworded}")
         del pending[tweet_id]
         save_json(PENDING_FILE, pending)
 
     elif action == 'edit':
-        # Save edit state so we know what to post when they reply
         edit_state = {'tweet_id': tweet_id}
         save_json(EDIT_FILE, edit_state)
         reworded = pending[tweet_id]['reworded']
@@ -105,7 +156,6 @@ async def handle_button(update, context):
         save_json(PENDING_FILE, pending)
 
 async def handle_edit_reply(update, context):
-    # Only respond to messages from you
     if update.message.chat_id != TELEGRAM_CHAT_ID:
         return
 
@@ -115,16 +165,27 @@ async def handle_edit_reply(update, context):
 
     tweet_id = edit_state['tweet_id']
     edited_text = update.message.text
+    pending = load_json(PENDING_FILE, {})
 
     if len(edited_text) > 280:
-        await update.message.reply_text(f"⚠️ That's {len(edited_text)} characters — too long for X! Please keep it under 280.")
+        await update.message.reply_text(f"⚠️ That's {len(edited_text)} characters — too long! Keep it under 280.")
         return
 
-    get_x_client().create_tweet(text=edited_text)
+    media_urls = pending.get(tweet_id, {}).get('media_urls', [])
+
+    if media_urls:
+        api_v1 = get_x_api_v1()
+        media_files = await download_media(media_urls)
+        media_ids = []
+        for path in media_files:
+            res = api_v1.media_upload(path)
+            media_ids.append(res.media_id)
+        get_x_client().create_tweet(text=edited_text, media_ids=media_ids)
+    else:
+        get_x_client().create_tweet(text=edited_text)
+
     await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
 
-    # Clear states
-    pending = load_json(PENDING_FILE, {})
     if tweet_id in pending:
         del pending[tweet_id]
         save_json(PENDING_FILE, pending)
@@ -143,24 +204,44 @@ async def check_tweets(app):
             kwargs = dict(
                 id=user_id,
                 max_results=5,
-                exclude=['retweets', 'replies']
+                exclude=['retweets', 'replies'],
+                expansions=['attachments.media_keys'],
+                media_fields=['url', 'preview_image_url', 'type', 'variants']
             )
 
             if since_id:
                 kwargs['since_id'] = since_id
             else:
-                # First run - only get tweets from today, don't go back further
                 kwargs['start_time'] = '2026-04-18T00:00:00Z'
 
-            tweets = client.get_users_tweets(**kwargs)
+            response = client.get_users_tweets(**kwargs)
 
-            if tweets.data:
-                seen[account] = str(tweets.data[0].id)
+            if response.data:
+                seen[account] = str(response.data[0].id)
                 save_json(SEEN_FILE, seen)
 
-                for tweet in reversed(tweets.data):
+                # Build media lookup
+                media_lookup = {}
+                if response.includes and 'media' in response.includes:
+                    for m in response.includes['media']:
+                        if m.type == 'photo':
+                            media_lookup[m.media_key] = m.url
+                        elif m.type in ('video', 'animated_gif'):
+                            # Get highest bitrate variant
+                            variants = [v for v in m.variants if v.get('content_type') == 'video/mp4']
+                            if variants:
+                                best = max(variants, key=lambda v: v.get('bit_rate', 0))
+                                media_lookup[m.media_key] = best['url']
+
+                for tweet in reversed(response.data):
+                    media_urls = []
+                    if hasattr(tweet, 'attachments') and tweet.attachments:
+                        for key in tweet.attachments.get('media_keys', []):
+                            if key in media_lookup:
+                                media_urls.append(media_lookup[key])
+
                     reworded = reword_tweet(tweet.text)
-                    await send_for_approval(app, str(tweet.id), tweet.text, reworded, account)
+                    await send_for_approval(app, str(tweet.id), tweet.text, reworded, account, media_urls)
                     await asyncio.sleep(2)
 
         except Exception as e:
