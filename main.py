@@ -48,13 +48,17 @@ def get_x_api_v1():
     return tweepy.API(auth)
 
 def reword_tweet(text):
+    # Remove t.co links from text
+    import re
+    text = re.sub(r'https://t\.co/\S+', '', text).strip()
+    
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=280,
         messages=[{
             "role": "user",
-            "content": f"Reword this tweet slightly. Keep the same facts and meaning. Keep it under 280 characters. Sound natural. Do not add hashtags unless the original has them. Only return the reworded tweet, nothing else: {text}"
+            "content": f"Reword this tweet slightly. Keep the same facts and meaning. Keep it under 280 characters. Sound natural. Preserve any bullet points or list formatting from the original. Do not add hashtags unless the original has them. Do not add any URLs or links. Only return the reworded tweet, nothing else: {text}"
         }]
     )
     return message.content[0].text
