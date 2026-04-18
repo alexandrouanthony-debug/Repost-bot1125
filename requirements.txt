@@ -1,3 +1,6 @@
 tweepy
 anthropic
 python-telegram-bot
+httpx
+requests
+requests-oauthlib
