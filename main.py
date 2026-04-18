@@ -161,7 +161,7 @@ async def handle_button(update, context):
         await query.edit_message_text("Already handled.")
         return
 
-    if action == 'approve':
+  if action == 'approve':
         reworded = pending[tweet_id]['reworded']
         media_urls = pending[tweet_id].get('media_urls', [])
 
@@ -185,7 +185,6 @@ async def handle_button(update, context):
 
         del pending[tweet_id]
         save_json(PENDING_FILE, pending)
-
     elif action == 'edit':
         edit_state = {'tweet_id': tweet_id}
         save_json(EDIT_FILE, edit_state)
