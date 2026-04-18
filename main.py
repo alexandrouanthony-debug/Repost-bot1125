@@ -43,6 +43,25 @@ def get_x_client():
         access_token_secret=X_ACCESS_TOKEN_SECRET
     )
 
+def post_tweet_to_x(text, media_ids=None):
+    auth = OAuth1(
+        X_CONSUMER_KEY,
+        X_CONSUMER_SECRET,
+        X_ACCESS_TOKEN,
+        X_ACCESS_TOKEN_SECRET
+    )
+    payload = {"text": text}
+    if media_ids:
+        payload["media"] = {"media_ids": media_ids}
+    response = requests.post(
+        'https://api.twitter.com/2/tweets',
+        auth=auth,
+        json=payload
+    )
+    if response.status_code not in (200, 201):
+        raise Exception(f"{response.status_code} {response.text}")
+    return response.json()
+
 def upload_media_to_x(file_path):
     auth = OAuth1(
         X_CONSUMER_KEY,
@@ -64,9 +83,7 @@ def upload_media_to_x(file_path):
         return None
 
 def reword_tweet(text):
-    # Remove t.co links from text
     text = re.sub(r'https://t\.co/\S+', '', text).strip()
-
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
         model="claude-sonnet-4-6",
@@ -156,12 +173,9 @@ async def handle_button(update, context):
                     media_id = upload_media_to_x(path)
                     if media_id:
                         media_ids.append(media_id)
-                if media_ids:
-                    get_x_client().create_tweet(text=reworded, media_ids=media_ids, user_auth=True)
-                else:
-                    get_x_client().create_tweet(text=reworded, user_auth=True)
+                post_tweet_to_x(reworded, media_ids=media_ids if media_ids else None)
             else:
-                get_x_client().create_tweet(text=reworded, user_auth=True)
+                post_tweet_to_x(reworded)
 
             await query.edit_message_text(f"✅ Posted!\n\n{reworded}")
 
@@ -210,12 +224,9 @@ async def handle_edit_reply(update, context):
                 media_id = upload_media_to_x(path)
                 if media_id:
                     media_ids.append(media_id)
-            if media_ids:
-                get_x_client().create_tweet(text=edited_text, media_ids=media_ids, user_auth=True)
-            else:
-                get_x_client().create_tweet(text=edited_text, user_auth=True)
+            post_tweet_to_x(edited_text, media_ids=media_ids if media_ids else None)
         else:
-            get_x_client().create_tweet(text=edited_text, user_auth=True)
+            post_tweet_to_x(edited_text)
 
         await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
 
