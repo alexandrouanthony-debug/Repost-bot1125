@@ -40,12 +40,30 @@ def get_x_client():
         access_token_secret=X_ACCESS_TOKEN_SECRET
     )
 
-def get_x_api_v1():
-    auth = tweepy.OAuth1UserHandler(
-        X_CONSUMER_KEY, X_CONSUMER_SECRET,
-        X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET
+def upload_media_to_x(file_path):
+    import requests
+    from requests_oauthlib import OAuth1
+    
+    auth = OAuth1(
+        X_CONSUMER_KEY,
+        X_CONSUMER_SECRET,
+        X_ACCESS_TOKEN,
+        X_ACCESS_TOKEN_SECRET
     )
-    return tweepy.API(auth)
+    
+    with open(file_path, 'rb') as f:
+        files = {'media': f}
+        response = requests.post(
+            'https://upload.twitter.com/1.1/media/upload.json',
+            auth=auth,
+            files=files
+        )
+    
+    if response.status_code == 200:
+        return response.json()['media_id_string']
+    else:
+        logging.error(f"Media upload failed: {response.text}")
+        return None
 
 def reword_tweet(text):
     # Remove t.co links from text
@@ -132,13 +150,13 @@ async def handle_button(update, context):
         media_urls = pending[tweet_id].get('media_urls', [])
 
         if media_urls:
-            api_v1 = get_x_api_v1()
             media_files = await download_media(media_urls)
             media_ids = []
             for path in media_files:
-                res = api_v1.media_upload(path)
-                media_ids.append(res.media_id)
-            get_x_client().create_tweet(text=reworded, media_ids=media_ids)
+                media_id = upload_media_to_x(path)
+                if media_id:
+                    media_ids.append(media_id)
+            get_x_client().create_tweet(text=reworded, media_ids=media_ids if media_ids else None)
         else:
             get_x_client().create_tweet(text=reworded)
 
