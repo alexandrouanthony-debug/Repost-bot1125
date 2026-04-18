@@ -1,0 +1,3 @@
+tweepy
+anthropic
+python-telegram-bot
