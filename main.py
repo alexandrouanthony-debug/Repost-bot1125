@@ -1,7 +1,10 @@
-import os, json, asyncio, logging, httpx
+import os, json, asyncio, logging, re
+import httpx
+import requests
 import tweepy
 import anthropic
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from requests_oauthlib import OAuth1
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +18,7 @@ TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = int(os.environ['TELEGRAM_CHAT_ID'])
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 
-ACCOUNTS = ['OfficialJoelF', 'growingmiami']
+ACCOUNTS = ['OfficialJoelF', 'tradedmiami']
 SEEN_FILE = 'seen_tweets.json'
 PENDING_FILE = 'pending_tweets.json'
 EDIT_FILE = 'edit_state.json'
@@ -41,16 +44,12 @@ def get_x_client():
     )
 
 def upload_media_to_x(file_path):
-    import requests
-    from requests_oauthlib import OAuth1
-    
     auth = OAuth1(
         X_CONSUMER_KEY,
         X_CONSUMER_SECRET,
         X_ACCESS_TOKEN,
         X_ACCESS_TOKEN_SECRET
     )
-    
     with open(file_path, 'rb') as f:
         files = {'media': f}
         response = requests.post(
@@ -58,18 +57,16 @@ def upload_media_to_x(file_path):
             auth=auth,
             files=files
         )
-    
     if response.status_code == 200:
         return response.json()['media_id_string']
     else:
-        logging.error(f"Media upload failed: {response.text}")
+        logging.error(f"Media upload failed: {response.status_code} {response.text}")
         return None
 
 def reword_tweet(text):
     # Remove t.co links from text
-    import re
     text = re.sub(r'https://t\.co/\S+', '', text).strip()
-    
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
         model="claude-sonnet-4-6",
@@ -117,7 +114,6 @@ async def send_for_approval(app, tweet_id, original, reworded, account, media_ur
     if media_urls:
         media_files = await download_media(media_urls)
         if media_files:
-            from telegram import InputMediaPhoto, InputMediaVideo
             media_group = []
             for path in media_files:
                 if path.endswith('.mp4'):
@@ -125,7 +121,10 @@ async def send_for_approval(app, tweet_id, original, reworded, account, media_ur
                 else:
                     media_group.append(InputMediaPhoto(open(path, 'rb')))
             if media_group:
-                await app.bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=media_group)
+                try:
+                    await app.bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=media_group)
+                except Exception as e:
+                    logging.error(f"Error sending media group: {e}")
 
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
@@ -149,18 +148,27 @@ async def handle_button(update, context):
         reworded = pending[tweet_id]['reworded']
         media_urls = pending[tweet_id].get('media_urls', [])
 
-        if media_urls:
-            media_files = await download_media(media_urls)
-            media_ids = []
-            for path in media_files:
-                media_id = upload_media_to_x(path)
-                if media_id:
-                    media_ids.append(media_id)
-            get_x_client().create_tweet(text=reworded, media_ids=media_ids if media_ids else None)
-        else:
-            get_x_client().create_tweet(text=reworded)
+        try:
+            if media_urls:
+                media_files = await download_media(media_urls)
+                media_ids = []
+                for path in media_files:
+                    media_id = upload_media_to_x(path)
+                    if media_id:
+                        media_ids.append(media_id)
+                if media_ids:
+                    get_x_client().create_tweet(text=reworded, media_ids=media_ids, user_auth=True)
+                else:
+                    get_x_client().create_tweet(text=reworded, user_auth=True)
+            else:
+                get_x_client().create_tweet(text=reworded, user_auth=True)
 
-        await query.edit_message_text(f"✅ Posted!\n\n{reworded}")
+            await query.edit_message_text(f"✅ Posted!\n\n{reworded}")
+
+        except Exception as e:
+            logging.error(f"Error posting tweet: {e}")
+            await query.edit_message_text(f"❌ Failed to post: {e}")
+
         del pending[tweet_id]
         save_json(PENDING_FILE, pending)
 
@@ -193,20 +201,27 @@ async def handle_edit_reply(update, context):
         await update.message.reply_text(f"⚠️ That's {len(edited_text)} characters — too long! Keep it under 280.")
         return
 
-    media_urls = pending.get(tweet_id, {}).get('media_urls', [])
+    try:
+        media_urls = pending.get(tweet_id, {}).get('media_urls', [])
+        if media_urls:
+            media_files = await download_media(media_urls)
+            media_ids = []
+            for path in media_files:
+                media_id = upload_media_to_x(path)
+                if media_id:
+                    media_ids.append(media_id)
+            if media_ids:
+                get_x_client().create_tweet(text=edited_text, media_ids=media_ids, user_auth=True)
+            else:
+                get_x_client().create_tweet(text=edited_text, user_auth=True)
+        else:
+            get_x_client().create_tweet(text=edited_text, user_auth=True)
 
-    if media_urls:
-        api_v1 = get_x_api_v1()
-        media_files = await download_media(media_urls)
-        media_ids = []
-        for path in media_files:
-            res = api_v1.media_upload(path)
-            media_ids.append(res.media_id)
-        get_x_client().create_tweet(text=edited_text, media_ids=media_ids)
-    else:
-        get_x_client().create_tweet(text=edited_text)
+        await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
 
-    await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
+    except Exception as e:
+        logging.error(f"Error posting edited tweet: {e}")
+        await update.message.reply_text(f"❌ Failed to post: {e}")
 
     if tweet_id in pending:
         del pending[tweet_id]
@@ -242,14 +257,12 @@ async def check_tweets(app):
                 seen[account] = str(response.data[0].id)
                 save_json(SEEN_FILE, seen)
 
-                # Build media lookup
                 media_lookup = {}
                 if response.includes and 'media' in response.includes:
                     for m in response.includes['media']:
                         if m.type == 'photo':
                             media_lookup[m.media_key] = m.url
                         elif m.type in ('video', 'animated_gif'):
-                            # Get highest bitrate variant
                             variants = [v for v in m.variants if v.get('content_type') == 'video/mp4']
                             if variants:
                                 best = max(variants, key=lambda v: v.get('bit_rate', 0))
@@ -274,21 +287,18 @@ async def poll_loop(app):
         await check_tweets(app)
         await asyncio.sleep(900)
 
-def main():
+async def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_reply))
 
-    async def run():
-        async with app:
-            await app.initialize()
-            await app.start()
-            await asyncio.gather(
-                poll_loop(app),
-                app.updater.start_polling()
-            )
-
-    asyncio.run(run())
+    async with app:
+        await app.initialize()
+        await app.start()
+        await asyncio.gather(
+            poll_loop(app),
+            app.updater.start_polling()
+        )
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
