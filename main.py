@@ -2,7 +2,7 @@ import os, json, time, asyncio, logging
 import tweepy
 import anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CallbackQueryHandler
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO)
 
@@ -18,6 +18,7 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 ACCOUNTS = ['OfficialJoelF', 'tradedmiami']
 SEEN_FILE = 'seen_tweets.json'
 PENDING_FILE = 'pending_tweets.json'
+EDIT_FILE = 'edit_state.json'
 
 def load_json(path, default):
     try:
@@ -42,7 +43,7 @@ def get_x_client():
 def reword_tweet(text):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-4-20250514",
         max_tokens=280,
         messages=[{
             "role": "user",
@@ -58,6 +59,7 @@ async def send_for_approval(app, tweet_id, original, reworded, account):
 
     keyboard = [[
         InlineKeyboardButton("✅ Post it", callback_data=f"approve_{tweet_id}"),
+        InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{tweet_id}"),
         InlineKeyboardButton("❌ Skip", callback_data=f"reject_{tweet_id}")
     ]]
 
@@ -85,11 +87,48 @@ async def handle_button(update, context):
         reworded = pending[tweet_id]['reworded']
         get_x_client().create_tweet(text=reworded)
         await query.edit_message_text(f"✅ Posted!\n\n{reworded}")
-    else:
-        await query.edit_message_text("❌ Skipped.")
+        del pending[tweet_id]
+        save_json(PENDING_FILE, pending)
 
-    del pending[tweet_id]
-    save_json(PENDING_FILE, pending)
+    elif action == 'edit':
+        # Save edit state so we know what to post when they reply
+        edit_state = {'tweet_id': tweet_id}
+        save_json(EDIT_FILE, edit_state)
+        reworded = pending[tweet_id]['reworded']
+        await query.edit_message_text(
+            f"✏️ Send me your edited version and I'll post it.\n\nCurrent version:\n{reworded}"
+        )
+
+    elif action == 'reject':
+        await query.edit_message_text("❌ Skipped.")
+        del pending[tweet_id]
+        save_json(PENDING_FILE, pending)
+
+async def handle_edit_reply(update, context):
+    # Only respond to messages from you
+    if update.message.chat_id != TELEGRAM_CHAT_ID:
+        return
+
+    edit_state = load_json(EDIT_FILE, {})
+    if not edit_state.get('tweet_id'):
+        return
+
+    tweet_id = edit_state['tweet_id']
+    edited_text = update.message.text
+
+    if len(edited_text) > 280:
+        await update.message.reply_text(f"⚠️ That's {len(edited_text)} characters — too long for X! Please keep it under 280.")
+        return
+
+    get_x_client().create_tweet(text=edited_text)
+    await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
+
+    # Clear states
+    pending = load_json(PENDING_FILE, {})
+    if tweet_id in pending:
+        del pending[tweet_id]
+        save_json(PENDING_FILE, pending)
+    save_json(EDIT_FILE, {})
 
 async def check_tweets(app):
     client = get_x_client()
@@ -123,11 +162,12 @@ async def check_tweets(app):
 async def poll_loop(app):
     while True:
         await check_tweets(app)
-        await asyncio.sleep(900)  # Check every 15 minutes
+        await asyncio.sleep(900)
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_reply))
 
     loop = asyncio.get_event_loop()
     loop.create_task(poll_loop(app))
