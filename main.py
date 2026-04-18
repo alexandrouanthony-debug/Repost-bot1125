@@ -140,12 +140,19 @@ async def check_tweets(app):
             user_id = user.data.id
             since_id = seen.get(account)
 
-            tweets = client.get_users_tweets(
+            kwargs = dict(
                 id=user_id,
-                since_id=since_id,
                 max_results=5,
                 exclude=['retweets', 'replies']
             )
+
+            if since_id:
+                kwargs['since_id'] = since_id
+            else:
+                # First run - only get tweets from today, don't go back further
+                kwargs['start_time'] = '2026-04-18T00:00:00Z'
+
+            tweets = client.get_users_tweets(**kwargs)
 
             if tweets.data:
                 seen[account] = str(tweets.data[0].id)
