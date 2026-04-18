@@ -43,25 +43,6 @@ def get_x_client():
         access_token_secret=X_ACCESS_TOKEN_SECRET
     )
 
-def post_tweet_to_x(text, media_ids=None):
-    auth = OAuth1(
-        X_CONSUMER_KEY,
-        X_CONSUMER_SECRET,
-        X_ACCESS_TOKEN,
-        X_ACCESS_TOKEN_SECRET
-    )
-    payload = {"text": text}
-    if media_ids:
-        payload["media"] = {"media_ids": media_ids}
-    response = requests.post(
-        'https://api.twitter.com/2/tweets',
-        auth=auth,
-        json=payload
-    )
-    if response.status_code not in (200, 201):
-        raise Exception(f"{response.status_code} {response.text}")
-    return response.json()
-
 def upload_media_to_x(file_path):
     auth = OAuth1(
         X_CONSUMER_KEY,
@@ -81,6 +62,26 @@ def upload_media_to_x(file_path):
     else:
         logging.error(f"Media upload failed: {response.status_code} {response.text}")
         return None
+
+def post_tweet_to_x(text, media_ids=None):
+    auth = OAuth1(
+        X_CONSUMER_KEY,
+        X_CONSUMER_SECRET,
+        X_ACCESS_TOKEN,
+        X_ACCESS_TOKEN_SECRET
+    )
+    payload = {"text": text}
+    if media_ids:
+        payload["media"] = {"media_ids": media_ids}
+    response = requests.post(
+        'https://api.twitter.com/2/tweets',
+        auth=auth,
+        json=payload
+    )
+    logging.info(f"Tweet response: {response.status_code} {response.text}")
+    if response.status_code not in (200, 201):
+        raise Exception(f"{response.status_code} {response.text}")
+    return response.json()
 
 def reword_tweet(text):
     text = re.sub(r'https://t\.co/\S+', '', text).strip()
@@ -161,10 +162,9 @@ async def handle_button(update, context):
         await query.edit_message_text("Already handled.")
         return
 
-  if action == 'approve':
+    if action == 'approve':
         reworded = pending[tweet_id]['reworded']
         media_urls = pending[tweet_id].get('media_urls', [])
-
         try:
             if media_urls:
                 media_files = await download_media(media_urls)
@@ -173,142 +173,4 @@ async def handle_button(update, context):
                     media_id = upload_media_to_x(path)
                     if media_id:
                         media_ids.append(media_id)
-                post_tweet_to_x(reworded, media_ids=media_ids if media_ids else None)
-            else:
-                post_tweet_to_x(reworded)
-
-            await query.edit_message_text(f"✅ Posted!\n\n{reworded}")
-
-        except Exception as e:
-            logging.error(f"Error posting tweet: {e}")
-            await query.edit_message_text(f"❌ Failed to post: {e}")
-
-        del pending[tweet_id]
-        save_json(PENDING_FILE, pending)
-    elif action == 'edit':
-        edit_state = {'tweet_id': tweet_id}
-        save_json(EDIT_FILE, edit_state)
-        reworded = pending[tweet_id]['reworded']
-        await query.edit_message_text(
-            f"✏️ Send me your edited version and I'll post it.\n\nCurrent version:\n{reworded}"
-        )
-
-    elif action == 'reject':
-        await query.edit_message_text("❌ Skipped.")
-        del pending[tweet_id]
-        save_json(PENDING_FILE, pending)
-
-async def handle_edit_reply(update, context):
-    if update.message.chat_id != TELEGRAM_CHAT_ID:
-        return
-
-    edit_state = load_json(EDIT_FILE, {})
-    if not edit_state.get('tweet_id'):
-        return
-
-    tweet_id = edit_state['tweet_id']
-    edited_text = update.message.text
-    pending = load_json(PENDING_FILE, {})
-
-    if len(edited_text) > 280:
-        await update.message.reply_text(f"⚠️ That's {len(edited_text)} characters — too long! Keep it under 280.")
-        return
-
-    try:
-        media_urls = pending.get(tweet_id, {}).get('media_urls', [])
-        if media_urls:
-            media_files = await download_media(media_urls)
-            media_ids = []
-            for path in media_files:
-                media_id = upload_media_to_x(path)
-                if media_id:
-                    media_ids.append(media_id)
-            post_tweet_to_x(edited_text, media_ids=media_ids if media_ids else None)
-        else:
-            post_tweet_to_x(edited_text)
-
-        await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
-
-    except Exception as e:
-        logging.error(f"Error posting edited tweet: {e}")
-        await update.message.reply_text(f"❌ Failed to post: {e}")
-
-    if tweet_id in pending:
-        del pending[tweet_id]
-        save_json(PENDING_FILE, pending)
-    save_json(EDIT_FILE, {})
-
-async def check_tweets(app):
-    client = get_x_client()
-    seen = load_json(SEEN_FILE, {})
-
-    for account in ACCOUNTS:
-        try:
-            user = client.get_user(username=account)
-            user_id = user.data.id
-            since_id = seen.get(account)
-
-            kwargs = dict(
-                id=user_id,
-                max_results=5,
-                exclude=['retweets', 'replies'],
-                expansions=['attachments.media_keys'],
-                media_fields=['url', 'preview_image_url', 'type', 'variants']
-            )
-
-            if since_id:
-                kwargs['since_id'] = since_id
-            else:
-                kwargs['start_time'] = '2026-04-18T00:00:00Z'
-
-            response = client.get_users_tweets(**kwargs)
-
-            if response.data:
-                seen[account] = str(response.data[0].id)
-                save_json(SEEN_FILE, seen)
-
-                media_lookup = {}
-                if response.includes and 'media' in response.includes:
-                    for m in response.includes['media']:
-                        if m.type == 'photo':
-                            media_lookup[m.media_key] = m.url
-                        elif m.type in ('video', 'animated_gif'):
-                            variants = [v for v in m.variants if v.get('content_type') == 'video/mp4']
-                            if variants:
-                                best = max(variants, key=lambda v: v.get('bit_rate', 0))
-                                media_lookup[m.media_key] = best['url']
-
-                for tweet in reversed(response.data):
-                    media_urls = []
-                    if hasattr(tweet, 'attachments') and tweet.attachments:
-                        for key in tweet.attachments.get('media_keys', []):
-                            if key in media_lookup:
-                                media_urls.append(media_lookup[key])
-
-                    reworded = reword_tweet(tweet.text)
-                    await send_for_approval(app, str(tweet.id), tweet.text, reworded, account, media_urls)
-                    await asyncio.sleep(2)
-
-        except Exception as e:
-            logging.error(f"Error checking @{account}: {e}")
-
-async def poll_loop(app):
-    while True:
-        await check_tweets(app)
-        await asyncio.sleep(900)
-
-async def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CallbackQueryHandler(handle_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_reply))
-
-    async with app:
-        await app.initialize()
-        await app.start()
-        await asyncio.gather(
-            poll_loop(app),
-            app.updater.start_polling()
-        )
-
-if __name__ == '__main__':
-    asyncio.run(main())
+                post_tweet_to
