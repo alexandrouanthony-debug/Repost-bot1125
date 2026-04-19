@@ -48,7 +48,8 @@ def post_tweet_to_x(text, media_ids=None):
         X_CONSUMER_KEY,
         X_CONSUMER_SECRET,
         X_ACCESS_TOKEN,
-        X_ACCESS_TOKEN_SECRET
+        X_ACCESS_TOKEN_SECRET,
+        force_include_body=False
     )
     payload = {"text": text}
     if media_ids:
