@@ -251,7 +251,7 @@ async def check_tweets(app):
                 exclude=['retweets', 'replies'],
                 expansions=['attachments.media_keys', 'referenced_tweets.id'],
                 media_fields=['url', 'preview_image_url', 'type', 'variants'],
-                tweet_fields=['text', 'attachments', 'entities']
+                tweet_fields=['text', 'attachments', 'entities', 'note_tweet']
             )
 
             if since_id:
@@ -283,8 +283,13 @@ async def check_tweets(app):
                             if key in media_lookup:
                                 media_urls.append(media_lookup[key])
 
-                    reworded = reword_tweet(tweet.text)
-                    await send_for_approval(app, str(tweet.id), tweet.text, reworded, account, media_urls)
+                    # Get full text including note_tweet if available
+                    full_text = tweet.text
+                    if hasattr(tweet, 'note_tweet') and tweet.note_tweet:
+                        full_text = tweet.note_tweet.get('text', tweet.text)
+
+                    reworded = reword_tweet(full_text)
+                    await send_for_approval(app, str(tweet.id), full_text, reworded, account, media_urls)
                     await asyncio.sleep(2)
 
         except Exception as e:
