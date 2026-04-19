@@ -249,8 +249,9 @@ async def check_tweets(app):
                 id=user_id,
                 max_results=5,
                 exclude=['retweets', 'replies'],
-                expansions=['attachments.media_keys'],
-                media_fields=['url', 'preview_image_url', 'type', 'variants']
+                expansions=['attachments.media_keys', 'referenced_tweets.id'],
+                media_fields=['url', 'preview_image_url', 'type', 'variants'],
+                tweet_fields=['text', 'attachments', 'entities']
             )
 
             if since_id:
