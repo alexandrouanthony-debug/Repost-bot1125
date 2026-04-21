@@ -18,7 +18,7 @@ TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = int(os.environ['TELEGRAM_CHAT_ID'])
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 
-ACCOUNTS = ['OfficialJoelF', 'tradedmiami']
+ACCOUNTS = ['OfficialJoelF', 'tradedmiami', 'growingmiami', 'Kevin_Rutois', 'RealMichaelSchall']
 SEEN_FILE = 'seen_tweets.json'
 PENDING_FILE = 'pending_tweets.json'
 EDIT_FILE = 'edit_state.json'
