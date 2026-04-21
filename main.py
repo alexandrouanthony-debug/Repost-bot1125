@@ -1,4 +1,5 @@
 import os, json, asyncio, logging, re
+from datetime import datetime, timezone
 import httpx
 import requests
 import tweepy
@@ -189,7 +190,8 @@ async def handle_button(update, context):
         save_json(EDIT_FILE, edit_state)
         reworded = pending[tweet_id]['reworded']
         await query.edit_message_text(
-            f"✏️ Send me your edited version and I'll post it.\n\nCurrent version:\n{reworded}"
+            f"✏️ Send me your edited version and I'll post it.\n\nCurrent version:\n{reworded}\n\n"
+            f"💡 Tip: Send a photo or video with your message to replace the original media."
         )
 
     elif action == 'reject':
@@ -206,26 +208,53 @@ async def handle_edit_reply(update, context):
         return
 
     tweet_id = edit_state['tweet_id']
-    edited_text = update.message.text
     pending = load_json(PENDING_FILE, {})
 
+    # Get text: use caption if media was sent, otherwise plain text,
+    # fallback to the existing reworded version if neither provided
+    edited_text = (
+        update.message.caption
+        or update.message.text
+        or pending.get(tweet_id, {}).get('reworded', '')
+    )
+
     if len(edited_text) > 280:
-        await update.message.reply_text(f"⚠️ That's {len(edited_text)} characters — too long! Keep it under 280.")
+        await update.message.reply_text(
+            f"⚠️ That's {len(edited_text)} characters — too long! Keep it under 280."
+        )
         return
 
     try:
-        media_urls = pending.get(tweet_id, {}).get('media_urls', [])
-        if media_urls:
-            media_files = await download_media(media_urls)
-            media_ids = []
-            for path in media_files:
-                media_id = upload_media_to_x(path)
-                if media_id:
-                    media_ids.append(media_id)
-            post_tweet_to_x(edited_text, media_ids=media_ids if media_ids else None)
+        media_ids = []
+
+        if update.message.photo or update.message.video:
+            # User sent new media — download from Telegram and upload to X (replaces original)
+            if update.message.photo:
+                tg_file = await update.message.photo[-1].get_file()
+                ext = 'jpg'
+            else:
+                tg_file = await update.message.video.get_file()
+                ext = 'mp4'
+            path = f'/tmp/edit_media.{ext}'
+            await tg_file.download_to_drive(path)
+            media_id = upload_media_to_x(path)
+            if media_id:
+                media_ids.append(media_id)
+            logging.info(f"Edit: using new media from Telegram for tweet {tweet_id}")
         else:
-            post_tweet_to_x(edited_text)
+            # No new media — re-upload original media so it's preserved
+            media_urls = pending.get(tweet_id, {}).get('media_urls', [])
+            if media_urls:
+                media_files = await download_media(media_urls)
+                for path in media_files:
+                    media_id = upload_media_to_x(path)
+                    if media_id:
+                        media_ids.append(media_id)
+                logging.info(f"Edit: preserving {len(media_ids)} original media item(s) for tweet {tweet_id}")
+
+        post_tweet_to_x(edited_text, media_ids=media_ids if media_ids else None)
         await update.message.reply_text(f"✅ Posted your edited version!\n\n{edited_text}")
+
     except Exception as e:
         logging.error(f"Error posting edited tweet: {e}")
         await update.message.reply_text(f"❌ Failed to post: {e}")
@@ -255,9 +284,25 @@ async def check_tweets(app):
             )
 
             if since_id:
+                # Normal operation: only fetch tweets newer than last seen
                 kwargs['since_id'] = since_id
             else:
-                kwargs['start_time'] = '2026-04-18T00:00:00Z'
+                # First run for this account: fetch latest tweet just to record
+                # the cursor — don't process anything, so no catchup flood
+                logging.info(f"First run for @{account} — recording current tweet ID without processing.")
+                init_response = client.get_users_tweets(
+                    id=user_id,
+                    max_results=5,
+                    exclude=['retweets', 'replies'],
+                    tweet_fields=['text']
+                )
+                if init_response.data:
+                    seen[account] = str(init_response.data[0].id)
+                    save_json(SEEN_FILE, seen)
+                    logging.info(f"@{account} cursor set to {seen[account]}, will watch from next poll.")
+                else:
+                    logging.info(f"@{account} has no recent tweets to anchor on.")
+                continue  # Skip processing this account on first run
 
             response = client.get_users_tweets(**kwargs)
 
@@ -304,6 +349,7 @@ async def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_reply))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_edit_reply))  # handles media edits
 
     async with app:
         await app.initialize()
