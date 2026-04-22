@@ -19,8 +19,11 @@ TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = int(os.environ['TELEGRAM_CHAT_ID'])
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 
-ACCOUNTS = ['OfficialJoelF', 'tradedmiami', 'growingmiami', 'Kevin_Rutois', 'RealMichaelSchall']
-SEEN_FILE = 'seen_tweets.json'
+ACCOUNTS = ['OfficialJoelF', 'tradedmiami', 'growingmiami', 'Kevin_Rutois', 'RealMikeSchall']
+
+# In-memory cursor store — survives poll cycles but resets cleanly on each deploy.
+# On first deploy for any account, start_time=now is used so no catchup flood occurs.
+SEEN_CURSORS = {}  # { account: since_id_string }
 PENDING_FILE = 'pending_tweets.json'
 EDIT_FILE = 'edit_state.json'
 
@@ -266,13 +269,12 @@ async def handle_edit_reply(update, context):
 
 async def check_tweets(app):
     client = get_x_client()
-    seen = load_json(SEEN_FILE, {})
 
     for account in ACCOUNTS:
         try:
             user = client.get_user(username=account)
             user_id = user.data.id
-            since_id = seen.get(account)
+            since_id = SEEN_CURSORS.get(account)
 
             kwargs = dict(
                 id=user_id,
@@ -287,28 +289,17 @@ async def check_tweets(app):
                 # Normal operation: only fetch tweets newer than last seen
                 kwargs['since_id'] = since_id
             else:
-                # First run for this account: fetch latest tweet just to record
-                # the cursor — don't process anything, so no catchup flood
-                logging.info(f"First run for @{account} — recording current tweet ID without processing.")
-                init_response = client.get_users_tweets(
-                    id=user_id,
-                    max_results=5,
-                    exclude=['retweets', 'replies'],
-                    tweet_fields=['text']
-                )
-                if init_response.data:
-                    seen[account] = str(init_response.data[0].id)
-                    save_json(SEEN_FILE, seen)
-                    logging.info(f"@{account} cursor set to {seen[account]}, will watch from next poll.")
-                else:
-                    logging.info(f"@{account} has no recent tweets to anchor on.")
-                continue  # Skip processing this account on first run
+                # First poll for this account this deployment — use start_time=now
+                # so we never get a catchup flood regardless of how long the bot was down
+                start_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                kwargs['start_time'] = start_time
+                logging.info(f"First poll for @{account} — using start_time={start_time}, no catchup.")
 
             response = client.get_users_tweets(**kwargs)
 
             if response.data:
-                seen[account] = str(response.data[0].id)
-                save_json(SEEN_FILE, seen)
+                # Update in-memory cursor to newest tweet seen
+                SEEN_CURSORS[account] = str(response.data[0].id)
 
                 media_lookup = {}
                 if response.includes and 'media' in response.includes:
@@ -336,6 +327,11 @@ async def check_tweets(app):
                     reworded = reword_tweet(full_text)
                     await send_for_approval(app, str(tweet.id), full_text, reworded, account, media_urls)
                     await asyncio.sleep(2)
+            else:
+                # No new tweets — still mark cursor as initialized so next poll uses since_id
+                if account not in SEEN_CURSORS:
+                    SEEN_CURSORS[account] = None
+                logging.info(f"No new tweets for @{account}")
 
         except Exception as e:
             logging.error(f"Error checking @{account}: {e}")
