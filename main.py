@@ -342,17 +342,21 @@ async def poll_loop(app):
         await asyncio.sleep(900)
 
 async def main():
+    # Brief delay on startup so Railway's old container has time to fully shut down
+    # before we connect to Telegram — prevents the 409 Conflict crash on redeploy
+    await asyncio.sleep(5)
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_reply))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_edit_reply))  # handles media edits
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_edit_reply))
 
     async with app:
         await app.initialize()
         await app.start()
         await asyncio.gather(
             poll_loop(app),
-            app.updater.start_polling()
+            app.updater.start_polling(drop_pending_updates=True)
         )
 
 if __name__ == '__main__':
