@@ -21,9 +21,14 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 
 ACCOUNTS = ['OfficialJoelF', 'tradedmiami', 'growingmiami', 'Kevin_Rutois', 'RealMikeSchall']
 
-# In-memory cursor store — survives poll cycles but resets cleanly on each deploy.
-# On first deploy for any account, start_time=now is used so no catchup flood occurs.
-SEEN_CURSORS = {}  # { account: since_id_string }
+# Set once at startup. All accounts use this as start_time on their first poll
+# so we never flood with old tweets on redeploy. After the first poll finds tweets,
+# each account switches to since_id tracking.
+BOT_START_TIME = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+# None = never polled, 'initialized' = polled but no tweets yet, tweet_id = normal tracking
+SEEN_CURSORS = {}
+
 PENDING_FILE = 'pending_tweets.json'
 EDIT_FILE = 'edit_state.json'
 
@@ -213,8 +218,6 @@ async def handle_edit_reply(update, context):
     tweet_id = edit_state['tweet_id']
     pending = load_json(PENDING_FILE, {})
 
-    # Get text: use caption if media was sent, otherwise plain text,
-    # fallback to the existing reworded version if neither provided
     edited_text = (
         update.message.caption
         or update.message.text
@@ -231,7 +234,6 @@ async def handle_edit_reply(update, context):
         media_ids = []
 
         if update.message.photo or update.message.video:
-            # User sent new media — download from Telegram and upload to X (replaces original)
             if update.message.photo:
                 tg_file = await update.message.photo[-1].get_file()
                 ext = 'jpg'
@@ -245,7 +247,6 @@ async def handle_edit_reply(update, context):
                 media_ids.append(media_id)
             logging.info(f"Edit: using new media from Telegram for tweet {tweet_id}")
         else:
-            # No new media — re-upload original media so it's preserved
             media_urls = pending.get(tweet_id, {}).get('media_urls', [])
             if media_urls:
                 media_files = await download_media(media_urls)
@@ -274,7 +275,7 @@ async def check_tweets(app):
         try:
             user = client.get_user(username=account)
             user_id = user.data.id
-            since_id = SEEN_CURSORS.get(account)
+            cursor = SEEN_CURSORS.get(account)  # None | 'initialized' | tweet_id_string
 
             kwargs = dict(
                 id=user_id,
@@ -285,21 +286,20 @@ async def check_tweets(app):
                 tweet_fields=['text', 'attachments', 'entities', 'note_tweet']
             )
 
-            if since_id:
-                # Normal operation: only fetch tweets newer than last seen
-                kwargs['since_id'] = since_id
+            if cursor and cursor != 'initialized':
+                # Have a real tweet ID — use since_id for efficient polling
+                kwargs['since_id'] = cursor
+                logging.info(f"Polling @{account} with since_id={cursor}")
             else:
-                # First poll for this account this deployment — use start_time=now
-                # so we never get a catchup flood regardless of how long the bot was down
-                start_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                kwargs['start_time'] = start_time
-                logging.info(f"First poll for @{account} — using start_time={start_time}, no catchup.")
+                # First poll or no tweets found yet — use the startup timestamp
+                kwargs['start_time'] = BOT_START_TIME
+                logging.info(f"Polling @{account} with start_time={BOT_START_TIME}")
 
             response = client.get_users_tweets(**kwargs)
 
             if response.data:
-                # Update in-memory cursor to newest tweet seen
                 SEEN_CURSORS[account] = str(response.data[0].id)
+                logging.info(f"@{account}: {len(response.data)} new tweet(s), cursor -> {SEEN_CURSORS[account]}")
 
                 media_lookup = {}
                 if response.includes and 'media' in response.includes:
@@ -319,7 +319,6 @@ async def check_tweets(app):
                             if key in media_lookup:
                                 media_urls.append(media_lookup[key])
 
-                    # Get full text including note_tweet if available
                     full_text = tweet.text
                     if hasattr(tweet, 'note_tweet') and tweet.note_tweet:
                         full_text = tweet.note_tweet.get('text', tweet.text)
@@ -328,9 +327,9 @@ async def check_tweets(app):
                     await send_for_approval(app, str(tweet.id), full_text, reworded, account, media_urls)
                     await asyncio.sleep(2)
             else:
-                # No new tweets — still mark cursor as initialized so next poll uses since_id
-                if account not in SEEN_CURSORS:
-                    SEEN_CURSORS[account] = None
+                # No new tweets — mark initialized so we know we've polled at least once
+                if cursor is None:
+                    SEEN_CURSORS[account] = 'initialized'
                 logging.info(f"No new tweets for @{account}")
 
         except Exception as e:
@@ -342,9 +341,11 @@ async def poll_loop(app):
         await asyncio.sleep(900)
 
 async def main():
-    # Brief delay on startup so Railway's old container has time to fully shut down
-    # before we connect to Telegram — prevents the 409 Conflict crash on redeploy
-    await asyncio.sleep(5)
+    logging.info(f"Bot starting. BOT_START_TIME={BOT_START_TIME}")
+
+    # Brief startup delay so Railway's previous container fully disconnects
+    # from Telegram before we connect — avoids 409 Conflict on redeploy
+    await asyncio.sleep(8)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_button))
